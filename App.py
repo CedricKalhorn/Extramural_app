@@ -8,81 +8,110 @@ import streamlit as st
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(
-    page_title="Duco Monitoring App",
-    page_icon="📊",
-    layout="wide"
-)
+import os
+from datetime import date
+
+import pandas as pd
+import streamlit as st
+
+
+st.set_page_config(page_title="Duco Monitoring App", page_icon="📊", layout="wide")
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "duco_daily_log.csv")
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# =========================
-# HELPERS
-# =========================
+EXPECTED_COLUMNS = {
+    "date": "",
+    "stoplicht": "Groen",
+    "cat_score": 7,
+    "cat_flag": "Normaal",
+    "ouder_afwijkend_gedrag": 0,
+    "leerkracht_score": 7,
+    "wearable_steps_change_pct": 0.0,
+    "wearable_hrv_change_pct": 0.0,
+    "wearable_sleep_change_pct": 0.0,
+    "school_vermoeidheid": False,
+    "kinderpsycholoog_signaal": False,
+    "notities": "",
+}
+
+
 def init_dataframe() -> pd.DataFrame:
-    columns = [
-        "date",
-        "stoplicht",
-        "cat_score",
-        "cat_flag",
-        "ouder_afwijkend_gedrag",
-        "leerkracht_score",
-        "wearable_steps_change_pct",
-        "wearable_hrv_change_pct",
-        "wearable_sleep_change_pct",
-        "school_vermoeidheid",
-        "kinderpsycholoog_signaal",
-        "notities",
-    ]
-    return pd.DataFrame(columns=columns)
+    return pd.DataFrame(columns=list(EXPECTED_COLUMNS.keys()))
+
+
+def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for col, default in EXPECTED_COLUMNS.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df = df[list(EXPECTED_COLUMNS.keys())]
+
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+        df["cat_score"] = pd.to_numeric(df["cat_score"], errors="coerce").fillna(7).astype(int)
+        df["ouder_afwijkend_gedrag"] = pd.to_numeric(df["ouder_afwijkend_gedrag"], errors="coerce").fillna(0).astype(int)
+        df["leerkracht_score"] = pd.to_numeric(df["leerkracht_score"], errors="coerce").fillna(7).astype(int)
+        df["wearable_steps_change_pct"] = pd.to_numeric(df["wearable_steps_change_pct"], errors="coerce").fillna(0.0)
+        df["wearable_hrv_change_pct"] = pd.to_numeric(df["wearable_hrv_change_pct"], errors="coerce").fillna(0.0)
+        df["wearable_sleep_change_pct"] = pd.to_numeric(df["wearable_sleep_change_pct"], errors="coerce").fillna(0.0)
+
+        df["school_vermoeidheid"] = df["school_vermoeidheid"].astype(str).str.lower().isin(["true", "1", "yes"])
+        df["kinderpsycholoog_signaal"] = df["kinderpsycholoog_signaal"].astype(str).str.lower().isin(["true", "1", "yes"])
+
+        df["stoplicht"] = df["stoplicht"].fillna("Groen")
+        df["cat_flag"] = df["cat_flag"].fillna("Normaal")
+        df["notities"] = df["notities"].fillna("")
+
+    return df
 
 
 def load_data() -> pd.DataFrame:
-    if os.path.exists(DATA_FILE):
+    if not os.path.exists(DATA_FILE):
+        return init_dataframe()
+
+    try:
         df = pd.read_csv(DATA_FILE)
-        if not df.empty:
-            df["date"] = pd.to_datetime(df["date"]).dt.date
-        return df
-    return init_dataframe()
+    except pd.errors.EmptyDataError:
+        return init_dataframe()
+
+    if df.empty and len(df.columns) == 0:
+        return init_dataframe()
+
+    return ensure_schema(df)
 
 
 def save_data(df: pd.DataFrame) -> None:
-    df_to_save = df.copy()
+    df_to_save = ensure_schema(df)
     if not df_to_save.empty:
-        df_to_save["date"] = pd.to_datetime(df_to_save["date"]).astype(str)
+        df_to_save["date"] = pd.to_datetime(df_to_save["date"], errors="coerce").astype(str)
     df_to_save.to_csv(DATA_FILE, index=False)
 
 
 def upsert_row(df: pd.DataFrame, row: dict) -> pd.DataFrame:
+    df = ensure_schema(df)
     current_date = row["date"]
 
     if not df.empty and current_date in set(df["date"]):
         df = df[df["date"] != current_date]
 
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df = ensure_schema(df)
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
 
 def stoplicht_to_red_fraction(value: str) -> float:
-    mapping = {
-        "Groen": 0.0,
-        "Oranje": 0.5,
-        "Rood": 1.0,
-    }
+    mapping = {"Groen": 0.0, "Oranje": 0.5, "Rood": 1.0}
     return mapping.get(value, 0.0)
 
 
 def cat_flag_to_numeric(value: str) -> int:
-    mapping = {
-        "Normaal": 0,
-        "Borderline": 1,
-        "Abnormaal": 2,
-    }
+    mapping = {"Normaal": 0, "Borderline": 1, "Abnormaal": 2}
     return mapping.get(value, 0)
 
 
@@ -106,10 +135,11 @@ def safe_mean(series: pd.Series):
 
 
 def compute_metrics(df: pd.DataFrame) -> dict:
+    df = ensure_schema(df)
+
     if df.empty:
         return {}
 
-    df = df.copy()
     df["red_fraction"] = df["stoplicht"].apply(stoplicht_to_red_fraction)
     df["cat_flag_num"] = df["cat_flag"].apply(cat_flag_to_numeric)
     df["psych_signaal_num"] = df["kinderpsycholoog_signaal"].apply(bool_to_int)
@@ -121,42 +151,32 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
     metrics = {
         "entries_total": len(df),
-
         "red_7_mean": safe_mean(last_7["red_fraction"]) if not last_7.empty else None,
         "red_14_mean": safe_mean(last_14["red_fraction"]) if not last_14.empty else None,
         "red_28_mean": safe_mean(last_28["red_fraction"]) if not last_28.empty else None,
-
         "cat_score_7_mean": safe_mean(last_7["cat_score"]) if not last_7.empty else None,
         "cat_score_14_mean": safe_mean(last_14["cat_score"]) if not last_14.empty else None,
         "cat_score_28_mean": safe_mean(last_28["cat_score"]) if not last_28.empty else None,
-
         "cat_flag_7_abnormal_count": int((last_7["cat_flag"] == "Abnormaal").sum()) if not last_7.empty else 0,
         "cat_flag_14_abnormal_count": int((last_14["cat_flag"] == "Abnormaal").sum()) if not last_14.empty else 0,
         "cat_flag_7_borderline_or_abnormal_count": int(last_7["cat_flag"].isin(["Borderline", "Abnormaal"]).sum()) if not last_7.empty else 0,
-
         "ouder_7_sum": int(last_7["ouder_afwijkend_gedrag"].sum()) if not last_7.empty else 0,
         "ouder_14_sum": int(last_14["ouder_afwijkend_gedrag"].sum()) if not last_14.empty else 0,
-
         "leerkracht_28_mean": safe_mean(last_28["leerkracht_score"]) if not last_28.empty else None,
-
         "steps_7_mean": safe_mean(last_7["wearable_steps_change_pct"]) if not last_7.empty else None,
         "steps_14_mean": safe_mean(last_14["wearable_steps_change_pct"]) if not last_14.empty else None,
         "steps_28_mean": safe_mean(last_28["wearable_steps_change_pct"]) if not last_28.empty else None,
-
         "hrv_7_mean": safe_mean(last_7["wearable_hrv_change_pct"]) if not last_7.empty else None,
         "hrv_14_mean": safe_mean(last_14["wearable_hrv_change_pct"]) if not last_14.empty else None,
         "hrv_28_mean": safe_mean(last_28["wearable_hrv_change_pct"]) if not last_28.empty else None,
-
         "sleep_7_mean": safe_mean(last_7["wearable_sleep_change_pct"]) if not last_7.empty else None,
         "sleep_14_mean": safe_mean(last_14["wearable_sleep_change_pct"]) if not last_14.empty else None,
-
         "school_vermoeidheid_28_count": int(last_28["school_vermoeidheid_num"].sum()) if not last_28.empty else 0,
         "psych_signaal_14_count": int(last_14["psych_signaal_num"].sum()) if not last_14.empty else 0,
         "psych_signaal_28_count": int(last_28["psych_signaal_num"].sum()) if not last_28.empty else 0,
     }
 
     return metrics
-
 
 def detect_negative_trends(metrics: dict) -> list[str]:
     alerts = []
