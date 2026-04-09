@@ -8,19 +8,11 @@ import streamlit as st
 # =========================
 # CONFIG
 # =========================
-import os
-from datetime import date
-
-import pandas as pd
-import streamlit as st
-
-
 st.set_page_config(page_title="Duco Monitoring App", page_icon="📊", layout="wide")
 
 DATA_DIR = "data"
 DATA_FILE = os.path.join(DATA_DIR, "duco_daily_log.csv")
 os.makedirs(DATA_DIR, exist_ok=True)
-
 
 EXPECTED_COLUMNS = {
     "date": "",
@@ -29,8 +21,8 @@ EXPECTED_COLUMNS = {
     "blokje_rood": 0,
     "cat_score": 7,
     "cat_flag": "Normaal",
-    "ouder_afwijkend_gedrag": 0,
-    "leerkracht_score": 7,
+    "ouder_afwijkend_gedrag": 0,   # 1x/week
+    "leerkracht_score": 7,         # 1x/week
     "wearable_steps_change_pct": 0.0,
     "wearable_hrv_change_pct": 0.0,
     "wearable_sleep_change_pct": 0.0,
@@ -40,6 +32,9 @@ EXPECTED_COLUMNS = {
 }
 
 
+# =========================
+# DATA HELPERS
+# =========================
 def init_dataframe() -> pd.DataFrame:
     return pd.DataFrame(columns=list(EXPECTED_COLUMNS.keys()))
 
@@ -75,13 +70,18 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
         for col in numeric_float_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-        df["school_vermoeidheid"] = df["school_vermoeidheid"].astype(str).str.lower().isin(["true", "1", "yes"])
-        df["kinderpsycholoog_signaal"] = df["kinderpsycholoog_signaal"].astype(str).str.lower().isin(["true", "1", "yes"])
+        df["school_vermoeidheid"] = (
+            df["school_vermoeidheid"].astype(str).str.lower().isin(["true", "1", "yes"])
+        )
+        df["kinderpsycholoog_signaal"] = (
+            df["kinderpsycholoog_signaal"].astype(str).str.lower().isin(["true", "1", "yes"])
+        )
 
         df["cat_flag"] = df["cat_flag"].fillna("Normaal")
         df["notities"] = df["notities"].fillna("")
 
     return df
+
 
 def load_data() -> pd.DataFrame:
     if not os.path.exists(DATA_FILE):
@@ -118,10 +118,9 @@ def upsert_row(df: pd.DataFrame, row: dict) -> pd.DataFrame:
     return df
 
 
-def stoplicht_to_red_fraction(value: str) -> float:
-    mapping = {"Groen": 0.0, "Oranje": 0.5, "Rood": 1.0}
-    return mapping.get(value, 0.0)
-
+# =========================
+# FEATURE ENGINEERING
+# =========================
 def add_blokje_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -142,6 +141,7 @@ def add_blokje_features(df: pd.DataFrame) -> pd.DataFrame:
     df["pct_rood"] = df["pct_rood"].fillna(0)
 
     return df
+
 
 def cat_flag_to_numeric(value: str) -> int:
     mapping = {"Normaal": 0, "Borderline": 1, "Abnormaal": 2}
@@ -167,6 +167,34 @@ def safe_mean(series: pd.Series):
     return float(series.mean())
 
 
+def add_week_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    dt = pd.to_datetime(df["date"])
+    iso = dt.dt.isocalendar()
+    df["year"] = iso.year.astype(int)
+    df["week"] = iso.week.astype(int)
+    df["year_week"] = df["year"].astype(str) + "-W" + df["week"].astype(str).str.zfill(2)
+    return df
+
+
+def get_weekly_observation_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Zet ouder- en leerkrachtmetingen om naar weekniveau.
+    Bij meerdere entries in dezelfde week wordt de laatste entry van die week gebruikt.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["year", "week", "year_week", "ouder_afwijkend_gedrag", "leerkracht_score", "date"])
+
+    weekly_df = add_week_columns(df)
+    weekly_df = weekly_df.sort_values("date")
+    weekly_df = weekly_df.groupby(["year", "week", "year_week"], as_index=False).last()
+
+    return weekly_df[["year", "week", "year_week", "date", "ouder_afwijkend_gedrag", "leerkracht_score"]]
+
+
+# =========================
+# METRICS
+# =========================
 def compute_metrics(df: pd.DataFrame) -> dict:
     df = ensure_schema(df)
 
@@ -183,9 +211,17 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     last_14 = get_recent_window(df, 14)
     last_28 = get_recent_window(df, 28)
 
+    weekly_obs = get_weekly_observation_df(df)
+    weekly_obs = weekly_obs.sort_values("date")
+
+    last_1w_obs = weekly_obs.tail(1)
+    last_2w_obs = weekly_obs.tail(2)
+    last_4w_obs = weekly_obs.tail(4)
+
     metrics = {
         "entries_total": len(df),
 
+        # Stoplicht
         "pct_rood_7_mean": safe_mean(last_7["pct_rood"]) if not last_7.empty else None,
         "pct_rood_14_mean": safe_mean(last_14["pct_rood"]) if not last_14.empty else None,
         "pct_rood_28_mean": safe_mean(last_28["pct_rood"]) if not last_28.empty else None,
@@ -197,19 +233,27 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "oranje_count_7_sum": int(last_7["blokje_oranje"].sum()) if not last_7.empty else 0,
         "groen_count_7_sum": int(last_7["blokje_groen"].sum()) if not last_7.empty else 0,
 
+        # Vragenlijst
         "cat_score_7_mean": safe_mean(last_7["cat_score"]) if not last_7.empty else None,
         "cat_score_14_mean": safe_mean(last_14["cat_score"]) if not last_14.empty else None,
         "cat_score_28_mean": safe_mean(last_28["cat_score"]) if not last_28.empty else None,
 
         "cat_flag_7_abnormal_count": int((last_7["cat_flag"] == "Abnormaal").sum()) if not last_7.empty else 0,
         "cat_flag_14_abnormal_count": int((last_14["cat_flag"] == "Abnormaal").sum()) if not last_14.empty else 0,
-        "cat_flag_7_borderline_or_abnormal_count": int(last_7["cat_flag"].isin(["Borderline", "Abnormaal"]).sum()) if not last_7.empty else 0,
+        "cat_flag_7_borderline_or_abnormal_count": int(
+            last_7["cat_flag"].isin(["Borderline", "Abnormaal"]).sum()
+        ) if not last_7.empty else 0,
 
-        "ouder_7_sum": int(last_7["ouder_afwijkend_gedrag"].sum()) if not last_7.empty else 0,
-        "ouder_14_sum": int(last_14["ouder_afwijkend_gedrag"].sum()) if not last_14.empty else 0,
+        # Ouders 1x/week
+        "ouder_1w": int(last_1w_obs["ouder_afwijkend_gedrag"].sum()) if not last_1w_obs.empty else 0,
+        "ouder_2w_sum": int(last_2w_obs["ouder_afwijkend_gedrag"].sum()) if not last_2w_obs.empty else 0,
+        "ouder_4w_sum": int(last_4w_obs["ouder_afwijkend_gedrag"].sum()) if not last_4w_obs.empty else 0,
 
-        "leerkracht_28_mean": safe_mean(last_28["leerkracht_score"]) if not last_28.empty else None,
+        # Leerkracht 1x/week
+        "leerkracht_1w": safe_mean(last_1w_obs["leerkracht_score"]) if not last_1w_obs.empty else None,
+        "leerkracht_4w_mean": safe_mean(last_4w_obs["leerkracht_score"]) if not last_4w_obs.empty else None,
 
+        # Wearable
         "steps_7_mean": safe_mean(last_7["wearable_steps_change_pct"]) if not last_7.empty else None,
         "steps_14_mean": safe_mean(last_14["wearable_steps_change_pct"]) if not last_14.empty else None,
         "steps_28_mean": safe_mean(last_28["wearable_steps_change_pct"]) if not last_28.empty else None,
@@ -220,13 +264,20 @@ def compute_metrics(df: pd.DataFrame) -> dict:
 
         "sleep_7_mean": safe_mean(last_7["wearable_sleep_change_pct"]) if not last_7.empty else None,
         "sleep_14_mean": safe_mean(last_14["wearable_sleep_change_pct"]) if not last_14.empty else None,
+        "sleep_28_mean": safe_mean(last_28["wearable_sleep_change_pct"]) if not last_28.empty else None,
 
+        # Overig
         "school_vermoeidheid_28_count": int(last_28["school_vermoeidheid_num"].sum()) if not last_28.empty else 0,
         "psych_signaal_14_count": int(last_14["psych_signaal_num"].sum()) if not last_14.empty else 0,
         "psych_signaal_28_count": int(last_28["psych_signaal_num"].sum()) if not last_28.empty else 0,
     }
 
     return metrics
+
+
+# =========================
+# ALERTS
+# =========================
 def detect_negative_trends(metrics: dict) -> list[str]:
     alerts = []
 
@@ -245,10 +296,10 @@ def detect_negative_trends(metrics: dict) -> list[str]:
     if metrics.get("cat_score_7_mean") is not None and metrics["cat_score_7_mean"] <= 5:
         alerts.append("Negatieve trend gedetecteerd in emotionele vragenlijstscore.")
 
-    if metrics.get("ouder_7_sum", 0) >= 5:
+    if metrics.get("ouder_1w", 0) >= 5:
         alerts.append("Negatieve trend gedetecteerd in ouderobservaties.")
 
-    if metrics.get("leerkracht_28_mean") is not None and metrics["leerkracht_28_mean"] < 5:
+    if metrics.get("leerkracht_4w_mean") is not None and metrics["leerkracht_4w_mean"] < 5:
         alerts.append("Negatieve trend gedetecteerd in leerkrachtobservaties.")
 
     if metrics.get("steps_7_mean") is not None and metrics["steps_7_mean"] <= -20:
@@ -269,6 +320,9 @@ def detect_negative_trends(metrics: dict) -> list[str]:
     return alerts
 
 
+# =========================
+# INTERVENTIES
+# =========================
 def intervention_rules(metrics: dict) -> dict:
     if not metrics:
         return {}
@@ -277,45 +331,69 @@ def intervention_rules(metrics: dict) -> dict:
 
     add_on_checks = {
         "Stoplicht: week lang >5% meer rood / duidelijke rode trend": (metrics.get("pct_rood_7_mean") or 0) >= 5,
-        "Wearable stappen gedaald 20-30%": (metrics.get("steps_7_mean") is not None and metrics["steps_7_mean"] <= -20),
-        "Wearable HRV gedaald ≥20%": (metrics.get("hrv_7_mean") is not None and metrics["hrv_7_mean"] <= -20),
-        "Slaap gedaald ≥15%": (metrics.get("sleep_7_mean") is not None and metrics["sleep_7_mean"] <= -15),
+        "Wearable stappen gedaald 20-30%": (
+            metrics.get("steps_7_mean") is not None and metrics["steps_7_mean"] <= -20
+        ),
+        "Wearable HRV gedaald ≥20%": (
+            metrics.get("hrv_7_mean") is not None and metrics["hrv_7_mean"] <= -20
+        ),
+        "Slaap gedaald ≥15%": (
+            metrics.get("sleep_7_mean") is not None and metrics["sleep_7_mean"] <= -15
+        ),
         "Vragenlijst borderline/abnormaal": metrics.get("cat_flag_7_borderline_or_abnormal_count", 0) >= 1,
     }
     results["Add-on programma"] = add_on_checks
 
     hulpkracht_checks = {
         "Stoplicht 20-30% meer rood gedurende maand": (metrics.get("pct_rood_28_mean") or 0) >= 20,
-        "Wearable activiteit tijdens periode ≥20% lager": (metrics.get("steps_28_mean") is not None and metrics["steps_28_mean"] <= -20),
-        "Leerkrachtobservatie gemiddeld <5 over 28 dagen": (metrics.get("leerkracht_28_mean") is not None and metrics["leerkracht_28_mean"] < 5),
+        "Wearable activiteit tijdens periode ≥20% lager": (
+            metrics.get("steps_28_mean") is not None and metrics["steps_28_mean"] <= -20
+        ),
+        "Leerkrachtobservatie gemiddeld <5 over 4 weken": (
+            metrics.get("leerkracht_4w_mean") is not None and metrics["leerkracht_4w_mean"] < 5
+        ),
         "Kinderpsycholoog signaal aanwezig": metrics.get("psych_signaal_28_count", 0) >= 1,
     }
     results["Hulpkracht in de klas"] = hulpkracht_checks
 
     muziek_checks = {
         "Stoplicht ≥20% rood gedurende 2 weken": (metrics.get("pct_rood_14_mean") or 0) >= 20,
-        "HRV chronisch laag (≥20% daling)": (metrics.get("hrv_14_mean") is not None and metrics["hrv_14_mean"] <= -20),
-        "Slaap verslechtering ≥15%": (metrics.get("sleep_14_mean") is not None and metrics["sleep_14_mean"] <= -15),
+        "HRV chronisch laag (≥20% daling)": (
+            metrics.get("hrv_14_mean") is not None and metrics["hrv_14_mean"] <= -20
+        ),
+        "Slaap verslechtering ≥15%": (
+            metrics.get("sleep_14_mean") is not None and metrics["sleep_14_mean"] <= -15
+        ),
         "3 abnormale vragenlijstscores in week": metrics.get("cat_flag_7_abnormal_count", 0) >= 3,
-        "10 afwijkende gedragingen ouders in week": metrics.get("ouder_7_sum", 0) >= 10,
+        "10 afwijkende gedragingen ouders in 1 week": metrics.get("ouder_1w", 0) >= 10,
     }
     results["Muziektherapie"] = muziek_checks
 
     game_checks = {
         "Stoplicht ≥5% rood op sociaal/emotioneel gedrag": (metrics.get("pct_rood_7_mean") or 0) >= 5,
-        "HRV verslechterd ≥10%": (metrics.get("hrv_7_mean") is not None and metrics["hrv_7_mean"] <= -10),
-        "Slaap gedaald ≥15%": (metrics.get("sleep_7_mean") is not None and metrics["sleep_7_mean"] <= -15),
-        "5 afwijkende gedragingen ouders in week": metrics.get("ouder_7_sum", 0) >= 5,
+        "HRV verslechterd ≥10%": (
+            metrics.get("hrv_7_mean") is not None and metrics["hrv_7_mean"] <= -10
+        ),
+        "Slaap gedaald ≥15%": (
+            metrics.get("sleep_7_mean") is not None and metrics["sleep_7_mean"] <= -15
+        ),
+        "5 afwijkende gedragingen ouders in 1 week": metrics.get("ouder_1w", 0) >= 5,
     }
     results["Online game community"] = game_checks
 
     cgt_checks = {
         "Stoplicht ≥20% rood gedurende ≥2 weken": (metrics.get("pct_rood_14_mean") or 0) >= 20,
-        "Stappen 20-30% lager over 14 dagen": (metrics.get("steps_14_mean") is not None and metrics["steps_14_mean"] <= -20),
-        "HRV ≥20% lager over 14 dagen": (metrics.get("hrv_14_mean") is not None and metrics["hrv_14_mean"] <= -20),
-        "Slaap ≥20% slechter over 14 dagen": (metrics.get("sleep_14_mean") is not None and metrics["sleep_14_mean"] <= -20),
+        "Stappen 20-30% lager over 14 dagen": (
+            metrics.get("steps_14_mean") is not None and metrics["steps_14_mean"] <= -20
+        ),
+        "HRV ≥20% lager over 14 dagen": (
+            metrics.get("hrv_14_mean") is not None and metrics["hrv_14_mean"] <= -20
+        ),
+        "Slaap ≥20% slechter over 14 dagen": (
+            metrics.get("sleep_14_mean") is not None and metrics["sleep_14_mean"] <= -20
+        ),
         "3 abnormale vragenlijstscores in 14 dagen": metrics.get("cat_flag_14_abnormal_count", 0) >= 3,
-        "20 afwijkende gedragingen ouders in 14 dagen": metrics.get("ouder_14_sum", 0) >= 20,
+        "20 afwijkende gedragingen ouders in 2 weken": metrics.get("ouder_2w_sum", 0) >= 20,
         "Kinderpsycholoog signaal aanwezig": metrics.get("psych_signaal_14_count", 0) >= 1,
     }
     results["CGT"] = cgt_checks
@@ -337,7 +415,12 @@ def summarize_interventions(results: dict) -> dict:
 
 
 def show_metric_card(title: str, value, suffix: str = ""):
-    display_value = "-" if value is None else f"{value:.2f}{suffix}" if isinstance(value, float) else f"{value}{suffix}"
+    if value is None:
+        display_value = "-"
+    elif isinstance(value, float):
+        display_value = f"{value:.1f}{suffix}"
+    else:
+        display_value = f"{value}{suffix}"
     st.metric(title, display_value)
 
 
@@ -364,63 +447,36 @@ st.caption("Dagelijkse registratie, trendanalyse en interventie-advies")
 # =========================
 # SIDEBAR INPUT
 # =========================
-st.sidebar.header("Dagelijkse invoer")
+st.sidebar.header("Invoer")
 
 input_date = st.sidebar.date_input("Datum", value=date.today())
 
 st.sidebar.subheader("Stoplichtblokje sensor-data")
+blokje_groen = st.sidebar.number_input("Aantal keer groen vandaag", min_value=0, max_value=500, value=0, step=1)
+blokje_oranje = st.sidebar.number_input("Aantal keer oranje vandaag", min_value=0, max_value=500, value=0, step=1)
+blokje_rood = st.sidebar.number_input("Aantal keer rood vandaag", min_value=0, max_value=500, value=0, step=1)
 
-blokje_groen = st.sidebar.number_input(
-    "Aantal keer groen vandaag",
-    min_value=0,
-    max_value=500,
-    value=0,
-    step=1
-)
+cat_score = st.sidebar.slider("CAT emotionele vragenlijst score", min_value=1, max_value=10, value=7)
+cat_flag = st.sidebar.selectbox("CAT classificatie", ["Normaal", "Borderline", "Abnormaal"])
 
-blokje_oranje = st.sidebar.number_input(
-    "Aantal keer oranje vandaag",
-    min_value=0,
-    max_value=500,
-    value=0,
-    step=1
-)
-
-blokje_rood = st.sidebar.number_input(
-    "Aantal keer rood vandaag",
-    min_value=0,
-    max_value=500,
-    value=0,
-    step=1
-)
-
-cat_score = st.sidebar.slider(
-    "CAT emotionele vragenlijst score",
-    min_value=1,
-    max_value=10,
-    value=7
-)
-
-cat_flag = st.sidebar.selectbox(
-    "CAT classificatie",
-    ["Normaal", "Borderline", "Abnormaal"]
-)
-
+st.sidebar.subheader("Ouderobservatie (1x/week)")
 ouder_afwijkend_gedrag = st.sidebar.number_input(
-    "Aantal afwijkende gedragingen ouders vandaag",
+    "Aantal afwijkende gedragingen deze week",
     min_value=0,
-    max_value=20,
+    max_value=50,
     value=0,
     step=1
 )
 
+st.sidebar.subheader("Leerkrachtobservatie (1x/week)")
 leerkracht_score = st.sidebar.slider(
-    "Leerkracht observatiescore",
+    "Leerkracht observatiescore deze week",
     min_value=1,
     max_value=10,
     value=7
 )
 
+st.sidebar.subheader("Wearable")
 wearable_steps_change_pct = st.sidebar.number_input(
     "Wearable stappen verandering t.o.v. baseline (%)",
     min_value=-100.0,
@@ -445,16 +501,9 @@ wearable_sleep_change_pct = st.sidebar.number_input(
     step=1.0
 )
 
-school_vermoeidheid = st.sidebar.checkbox(
-    "Schoolvermoeidheid / middagdip aanwezig"
-)
-
-kinderpsycholoog_signaal = st.sidebar.checkbox(
-    "Signaal van kinderpsycholoog"
-)
-
+school_vermoeidheid = st.sidebar.checkbox("Schoolvermoeidheid / middagdip aanwezig")
+kinderpsycholoog_signaal = st.sidebar.checkbox("Signaal van kinderpsycholoog")
 notities = st.sidebar.text_area("Notities")
-
 
 if st.sidebar.button("Opslaan"):
     row = {
@@ -476,7 +525,7 @@ if st.sidebar.button("Opslaan"):
 
     df = upsert_row(df, row)
     save_data(df)
-    st.sidebar.success("Dagregistratie opgeslagen.")
+    st.sidebar.success("Registratie opgeslagen.")
 
 
 # =========================
@@ -512,13 +561,13 @@ with tab1:
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            show_metric_card("Entries", metrics.get("entries_total"))
-            show_metric_card("Rood 7d gemiddelde", metrics.get("red_7_mean"))
+            show_metric_card("Aantal entries", metrics.get("entries_total"))
+            show_metric_card("Rood 7d gemiddelde", metrics.get("pct_rood_7_mean"), "%")
         with c2:
             show_metric_card("CAT score 7d", metrics.get("cat_score_7_mean"))
-            show_metric_card("Ouder signalen 7d", metrics.get("ouder_7_sum"))
+            show_metric_card("Ouder signalen 1w", metrics.get("ouder_1w"))
         with c3:
-            show_metric_card("Leerkracht 28d", metrics.get("leerkracht_28_mean"))
+            show_metric_card("Leerkracht 4w", metrics.get("leerkracht_4w_mean"))
             show_metric_card("Stappen 7d", metrics.get("steps_7_mean"), "%")
         with c4:
             show_metric_card("HRV 7d", metrics.get("hrv_7_mean"), "%")
@@ -538,20 +587,13 @@ with tab2:
         chart_df = add_blokje_features(chart_df)
 
         st.markdown("**Stoplichtblokje aantallen per dag**")
-        st.bar_chart(
-            chart_df.set_index("date")[["blokje_groen", "blokje_oranje", "blokje_rood"]]
-        )
+        st.bar_chart(chart_df.set_index("date")[["blokje_groen", "blokje_oranje", "blokje_rood"]])
 
         st.markdown("**Stoplichtblokje percentages per dag**")
-        st.line_chart(
-            chart_df.set_index("date")[["pct_groen", "pct_oranje", "pct_rood"]]
-        )
+        st.line_chart(chart_df.set_index("date")[["pct_groen", "pct_oranje", "pct_rood"]])
 
         st.markdown("**CAT score**")
         st.line_chart(chart_df.set_index("date")[["cat_score"]])
-
-        st.markdown("**Leerkrachtscore**")
-        st.line_chart(chart_df.set_index("date")[["leerkracht_score"]])
 
         st.markdown("**Wearable trends**")
         st.line_chart(
@@ -562,9 +604,14 @@ with tab2:
             ]]
         )
 
-        st.markdown("**Ouderobservaties**")
-        st.bar_chart(chart_df.set_index("date")[["ouder_afwijkend_gedrag"]])
+        weekly_obs = get_weekly_observation_df(df)
 
+        if not weekly_obs.empty:
+            st.markdown("**Ouderobservaties per week**")
+            st.bar_chart(weekly_obs.set_index("year_week")[["ouder_afwijkend_gedrag"]])
+
+            st.markdown("**Leerkrachtscore per week**")
+            st.line_chart(weekly_obs.set_index("year_week")[["leerkracht_score"]])
 
 with tab3:
     st.subheader("Interventie-advies")
